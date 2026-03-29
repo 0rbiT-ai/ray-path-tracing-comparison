@@ -11,7 +11,7 @@ plane = Plane((0, -1, 0), (0, 1, 0), (0.8, 0.8, 0.8))
 
 # Light
 light_pos = np.array([5, 5, 0])
-light_intensity = 1.5
+light_intensity = 120.0
 
 # Camera
 camera_pos = np.array([0, 0, 0])
