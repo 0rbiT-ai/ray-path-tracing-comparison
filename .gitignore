@@ -1,0 +1,10 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Images (generated outputs)
+*.png
+
+# OS files (optional)
+.DS_Store
+Thumbs.db
