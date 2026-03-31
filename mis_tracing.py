@@ -1,156 +1,232 @@
+"""
+mis_tracing.py — Multiple Importance Sampling (MIS) path tracer.
+
+Uses one-sample MIS with the balance heuristic:
+  - Strategy 1: importance_sample_light (biased toward light)
+  - Strategy 2: uniform_sample_hemisphere (unbiased)
+
+At each hit point:
+  1. Direct illumination via explicit shadow ray (NEE)
+  2. Indirect illumination via one-sample MIS
+     → randomly pick one strategy, weight by the mixture PDF
+"""
+
 import numpy as np
 from core.ray import Ray
-from core.utils import dot, normalize
-from scene import spheres, plane, light_pos, light_intensity
+from core.objects import Sphere
+from core.utils import normalize, dot
 
+# ── Try to import teammate's sampling functions ──────────────────────────
+# If core/sampling.py is not yet implemented, fall back to built-in stubs.
+# Delete this try/except block once the real sampling.py is ready.
+try:
+    from core.sampling import (
+        uniform_sample_hemisphere,
+        importance_sample_light,
+        importance_sample_light_pdf,
+    )
+except (ImportError, AttributeError):
+    # ── Temporary stubs ──────────────────────────────────────────────────
+    LIGHT_LOBE_EXPONENT = 20
+
+    def _build_basis(w):
+        """Build orthonormal basis (u, v, w) where w is the given unit vector."""
+        if abs(w[0]) > 0.1:
+            a = np.array([0.0, 1.0, 0.0])
+        else:
+            a = np.array([1.0, 0.0, 0.0])
+        v = np.cross(w, a)
+        v = v / np.linalg.norm(v)
+        u = np.cross(v, w)
+        return u, v, w
+
+    def uniform_sample_hemisphere(normal):
+        r1 = np.random.rand()
+        r2 = np.random.rand()
+        phi = 2.0 * np.pi * r1
+        cos_theta = r2
+        sin_theta = np.sqrt(1.0 - cos_theta * cos_theta)
+        local = np.array([sin_theta * np.cos(phi),
+                          sin_theta * np.sin(phi),
+                          cos_theta])
+        w = normal / np.linalg.norm(normal)
+        u, v, w = _build_basis(w)
+        direction = u * local[0] + v * local[1] + w * local[2]
+        direction = direction / np.linalg.norm(direction)
+        pdf = 1.0 / (2.0 * np.pi)
+        return direction, pdf
+
+    def importance_sample_light(normal, light_dir):
+        n = LIGHT_LOBE_EXPONENT
+        r1 = np.random.rand()
+        r2 = np.random.rand()
+        cos_theta = r1 ** (1.0 / (n + 1))
+        sin_theta = np.sqrt(1.0 - cos_theta * cos_theta)
+        phi = 2.0 * np.pi * r2
+        local = np.array([sin_theta * np.cos(phi),
+                          sin_theta * np.sin(phi),
+                          cos_theta])
+        w = light_dir / np.linalg.norm(light_dir)
+        u, v, w = _build_basis(w)
+        direction = u * local[0] + v * local[1] + w * local[2]
+        # Ensure direction is in the hemisphere of the surface normal
+        if np.dot(direction, normal) < 0:
+            direction = direction - 2.0 * np.dot(direction, normal) * normal
+        direction = direction / np.linalg.norm(direction)
+        cos_alpha = max(np.dot(direction, light_dir), 0.0)
+        pdf = (n + 1) / (2.0 * np.pi) * (cos_alpha ** n)
+        pdf = max(pdf, 1e-8)
+        return direction, pdf
+
+    def importance_sample_light_pdf(direction, light_dir):
+        n = LIGHT_LOBE_EXPONENT
+        cos_alpha = max(np.dot(direction, light_dir), 0.0)
+        pdf = (n + 1) / (2.0 * np.pi) * (cos_alpha ** n)
+        return max(pdf, 1e-8)
+# ── End of temporary stubs ───────────────────────────────────────────────
+
+
+# ── Constants ────────────────────────────────────────────────────────────
 EPSILON = 1e-4
 PI = np.pi
+BG_COLOR = np.array([0.1, 0.1, 0.15])
 
-def uniform_sample_hemisphere(normal):
-    # Random numbers
-    r1 = np.random.rand()
-    r2 = np.random.rand()
 
-    phi = 2 * PI * r1
-    z = r2
-    sin_theta = np.sqrt(1 - z * z)
+def intersect_scene(ray, scene):
+    """
+    Find the closest intersection of `ray` with any object in the scene.
 
-    x = sin_theta * np.cos(phi)
-    y = sin_theta * np.sin(phi)
-
-    # Local direction (around Z axis)
-    local_dir = np.array([x, y, z])
-
-    # -------------------------
-    # Build orthonormal basis
-    # -------------------------
-    w = normal / np.linalg.norm(normal)
-
-    if abs(w[0]) > 0.1:
-        a = np.array([0, 1, 0])
-    else:
-        a = np.array([1, 0, 0])
-
-    v = np.cross(w, a)
-    v = v / np.linalg.norm(v)
-
-    u = np.cross(v, w)
-
-    # -------------------------
-    # Transform to world space
-    # -------------------------
-    world_dir = (
-        u * local_dir[0] +
-        v * local_dir[1] +
-        w * local_dir[2]
-    )
-
-    world_dir = world_dir / np.linalg.norm(world_dir)
-
-    # Uniform hemisphere PDF
-    pdf = 1 / (2 * PI)
-
-    return world_dir, pdf
-
-# -------------------------
-# Scene Intersection Helper
-# -------------------------
-def intersect_scene(ray):
-    closest_t = float('inf')
+    Returns:
+        (hit_point, normal, obj)  on hit
+        (None, None, None)        on miss
+    """
+    closest_t = np.inf
     hit_obj = None
 
-    # Check spheres
-    for obj in spheres:
+    for obj in scene["spheres"]:
         t = obj.intersect(ray)
-        if t and t < closest_t:
+        if t is not None and t > EPSILON and t < closest_t:
             closest_t = t
             hit_obj = obj
 
-    # Check plane
-    t = plane.intersect(ray)
-    if t and t < closest_t:
-        closest_t = t
-        hit_obj = plane
+    if scene["plane"] is not None:
+        t = scene["plane"].intersect(ray)
+        if t is not None and t > EPSILON and t < closest_t:
+            closest_t = t
+            hit_obj = scene["plane"]
 
     if hit_obj is None:
         return None, None, None
 
     hit_point = ray.origin + closest_t * ray.direction
 
-    if isinstance(hit_obj, type(plane)):
-        normal = plane.normal
-    else:
+    # Compute surface normal
+    if isinstance(hit_obj, Sphere):
         normal = normalize(hit_point - hit_obj.center)
+    else:
+        # Plane — flip normal to face the incoming ray
+        normal = hit_obj.normal.copy()
+        if dot(normal, ray.direction) > 0:
+            normal = -normal
 
     return hit_point, normal, hit_obj
 
 
-# -------------------------
-# MIS TRACE FUNCTION
-# -------------------------
-def mis_trace(ray, depth):
-    if depth <= 0:
-        return np.array([0.0, 0.0, 0.0])
+def shadow_test(hit_point, normal, light_dir, light_dist, scene):
+    """
+    Returns 1.0 if the point light is visible from `hit_point`, 0.0 if blocked.
+    """
+    shadow_origin = hit_point + normal * EPSILON
+    shadow_ray = Ray(shadow_origin, light_dir)
 
-    hit_point, normal, obj = intersect_scene(ray)
+    for obj in scene["spheres"]:
+        t = obj.intersect(shadow_ray)
+        if t is not None and t > EPSILON and t < light_dist:
+            return 0.0
+
+    if scene["plane"] is not None:
+        t = scene["plane"].intersect(shadow_ray)
+        if t is not None and t > EPSILON and t < light_dist:
+            return 0.0
+
+    return 1.0
+
+
+def mis_trace(ray, scene, depth):
+    """
+    One-sample MIS path tracer.
+
+    At each surface hit:
+      1. Ambient term
+      2. Direct illumination via explicit shadow ray (NEE)
+      3. Indirect illumination via one-sample MIS:
+         - 50% chance: sample direction biased toward light
+         - 50% chance: sample direction uniformly over hemisphere
+         - Weight by mixture PDF (balance heuristic)
+    """
+    if depth <= 0:
+        return np.zeros(3)
+
+    hit_point, normal, obj = intersect_scene(ray, scene)
 
     if obj is None:
-        return np.array([0.0, 0.0, 0.0])
+        return BG_COLOR.copy()
 
     color = obj.color
+    brdf = color / PI  # Lambertian diffuse BRDF
 
-    # -------------------------
-    # 🌞 DIRECT LIGHT
-    # -------------------------
+    light_pos = scene["light_pos"]
+    light_intensity = scene["light_intensity"]
+
+    # ── 1. Ambient ───────────────────────────────────────────────────────
+    ambient = 0.05 * color
+
+    # ── 2. Direct illumination (NEE — shadow ray to point light) ─────────
     to_light = light_pos - hit_point
-    light_distance = np.linalg.norm(to_light)
-    light_dir = normalize(to_light)
+    light_dist = np.linalg.norm(to_light)
+    light_dir = to_light / light_dist
 
-    shadow_ray = Ray(hit_point + normal * EPSILON, light_dir)
-    shadow_hit_point, _, _ = intersect_scene(shadow_ray)
+    visibility = shadow_test(hit_point, normal, light_dir, light_dist, scene)
 
-    visible = True
-    if shadow_hit_point is not None:
-        shadow_dist = np.linalg.norm(shadow_hit_point - hit_point)
-        if shadow_dist > EPSILON and shadow_dist < light_distance:
-            visible = False
+    direct = np.zeros(3)
+    if visibility > 0.0:
+        cos_direct = max(dot(normal, light_dir), 0.0)
+        direct = brdf * light_intensity * cos_direct / (light_dist * light_dist)
 
-    direct = np.array([0.0, 0.0, 0.0])
+    # ── 3. Indirect illumination (one-sample MIS) ────────────────────────
+    #
+    # Randomly choose ONE of two strategies:
+    #   Strategy A — importance_sample_light: biased toward light direction
+    #   Strategy B — uniform_sample_hemisphere: unbiased random
+    #
+    # Mixture PDF = 0.5 × pdf_A(ω) + 0.5 × pdf_B(ω)
+    # This is the balance heuristic — provably near-optimal (Veach 1995).
 
-    if visible:
-        lambert = max(dot(normal, light_dir), 0.0)
-        distance2 = light_distance ** 2
-        direct = (color / PI) * light_intensity * lambert / (distance2 + 1e-6)
+    if np.random.rand() < 0.5:
+        # Strategy A: light-biased sampling
+        sample_dir, pdf_sample = importance_sample_light(normal, light_dir)
+        pdf_other = 1.0 / (2.0 * PI)  # uniform hemisphere PDF
+    else:
+        # Strategy B: uniform hemisphere sampling
+        sample_dir, pdf_sample = uniform_sample_hemisphere(normal)
+        pdf_other = importance_sample_light_pdf(sample_dir, light_dir)
 
-    # -------------------------
-    # 🔁 INDIRECT LIGHT
-    # -------------------------
-    sample_dir, pdf_brdf = uniform_sample_hemisphere(normal)
+    # Mixture PDF (balance heuristic with equal selection probabilities)
+    mixture_pdf = 0.5 * pdf_sample + 0.5 * pdf_other
 
-    new_ray = Ray(hit_point + normal * EPSILON, sample_dir)
-    indirect = mis_trace(new_ray, depth - 1)
+    # Trace the bounce ray
+    bounce_origin = hit_point + normal * EPSILON
+    bounce_ray = Ray(bounce_origin, sample_dir)
+    L_incoming = mis_trace(bounce_ray, scene, depth - 1)
 
     cos_theta = max(dot(normal, sample_dir), 0.0)
 
-    if pdf_brdf > 0:
-        indirect = indirect * (color / PI) * cos_theta / pdf_brdf
+    indirect = np.zeros(3)
+    if mixture_pdf > EPSILON:
+        indirect = brdf * L_incoming * cos_theta / mixture_pdf
 
-    indirect*=1.5
-
+    # Clamp negative values (can arise from numerical issues)
     indirect = np.maximum(indirect, 0.0)
 
-    # -------------------------
-    # ⚖️ MIS WEIGHTS
-    # -------------------------
-    pdf_light = 1.0 / (light_distance**2 + 1e-6)
-
-    denom = pdf_light + pdf_brdf + 1e-8
-
-    w_light = pdf_light / denom
-    w_brdf = pdf_brdf / denom
-
-    # -------------------------
-    # 🎨 FINAL COLOR
-    # -------------------------
-    ambient = 0.05*color
-    return ambient + w_light * direct + w_brdf * indirect
+    # ── 4. Combine ───────────────────────────────────────────────────────
+    return ambient + direct + indirect
