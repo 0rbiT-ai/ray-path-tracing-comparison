@@ -16,74 +16,11 @@ from core.ray import Ray
 from core.objects import Sphere
 from core.utils import normalize, dot
 
-# ── Try to import teammate's sampling functions ──────────────────────────
-# If core/sampling.py is not yet implemented, fall back to built-in stubs.
-# Delete this try/except block once the real sampling.py is ready.
-try:
-    from core.sampling import (
-        uniform_sample_hemisphere,
-        importance_sample_light,
-        importance_sample_light_pdf,
-    )
-except (ImportError, AttributeError):
-    # ── Temporary stubs ──────────────────────────────────────────────────
-    LIGHT_LOBE_EXPONENT = 20
-
-    def _build_basis(w):
-        """Build orthonormal basis (u, v, w) where w is the given unit vector."""
-        if abs(w[0]) > 0.1:
-            a = np.array([0.0, 1.0, 0.0])
-        else:
-            a = np.array([1.0, 0.0, 0.0])
-        v = np.cross(w, a)
-        v = v / np.linalg.norm(v)
-        u = np.cross(v, w)
-        return u, v, w
-
-    def uniform_sample_hemisphere(normal):
-        r1 = np.random.rand()
-        r2 = np.random.rand()
-        phi = 2.0 * np.pi * r1
-        cos_theta = r2
-        sin_theta = np.sqrt(1.0 - cos_theta * cos_theta)
-        local = np.array([sin_theta * np.cos(phi),
-                          sin_theta * np.sin(phi),
-                          cos_theta])
-        w = normal / np.linalg.norm(normal)
-        u, v, w = _build_basis(w)
-        direction = u * local[0] + v * local[1] + w * local[2]
-        direction = direction / np.linalg.norm(direction)
-        pdf = 1.0 / (2.0 * np.pi)
-        return direction, pdf
-
-    def importance_sample_light(normal, light_dir):
-        n = LIGHT_LOBE_EXPONENT
-        r1 = np.random.rand()
-        r2 = np.random.rand()
-        cos_theta = r1 ** (1.0 / (n + 1))
-        sin_theta = np.sqrt(1.0 - cos_theta * cos_theta)
-        phi = 2.0 * np.pi * r2
-        local = np.array([sin_theta * np.cos(phi),
-                          sin_theta * np.sin(phi),
-                          cos_theta])
-        w = light_dir / np.linalg.norm(light_dir)
-        u, v, w = _build_basis(w)
-        direction = u * local[0] + v * local[1] + w * local[2]
-        # Ensure direction is in the hemisphere of the surface normal
-        if np.dot(direction, normal) < 0:
-            direction = direction - 2.0 * np.dot(direction, normal) * normal
-        direction = direction / np.linalg.norm(direction)
-        cos_alpha = max(np.dot(direction, light_dir), 0.0)
-        pdf = (n + 1) / (2.0 * np.pi) * (cos_alpha ** n)
-        pdf = max(pdf, 1e-8)
-        return direction, pdf
-
-    def importance_sample_light_pdf(direction, light_dir):
-        n = LIGHT_LOBE_EXPONENT
-        cos_alpha = max(np.dot(direction, light_dir), 0.0)
-        pdf = (n + 1) / (2.0 * np.pi) * (cos_alpha ** n)
-        return max(pdf, 1e-8)
-# ── End of temporary stubs ───────────────────────────────────────────────
+from core.sampling import (
+    uniform_sample_hemisphere,
+    importance_sample_light,
+    importance_sample_light_pdf,
+)
 
 
 # ── Constants ────────────────────────────────────────────────────────────
