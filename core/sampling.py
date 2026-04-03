@@ -16,6 +16,35 @@ def build_basis(w):
     u = np.cross(v, w)
     return u, v, w
 
+PI = np.pi
+
+def cosine_weighted_hemisphere(normal):
+    r1 = np.random.rand()
+    r2 = np.random.rand()
+
+    phi = 2 * PI * r1
+    r = np.sqrt(r2)
+
+    x = r * np.cos(phi)
+    y = r * np.sin(phi)
+    z = np.sqrt(1 - r2)
+
+    # Build orthonormal basis
+    w = normal
+    if abs(w[0]) > 0.1:
+        u = np.cross(np.array([0,1,0]), w)
+    else:
+        u = np.cross(np.array([1,0,0]), w)
+
+    u = u / np.linalg.norm(u)
+    v = np.cross(w, u)
+
+    direction = x * u + y * v + z * w
+    direction = direction / np.linalg.norm(direction)
+
+    pdf = z / PI   # IMPORTANT
+
+    return direction, pdf
 
 def uniform_sample_hemisphere(normal):
     r1 = np.random.rand()
