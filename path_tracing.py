@@ -2,26 +2,7 @@ import numpy as np
 from core.ray import Ray
 from core.utils import normalize, dot
 from scene import spheres, plane, light_pos, light_intensity
-
-
-
-def sample_hemisphere(normal):
-    r1 = np.random.rand()
-    r2 = np.random.rand()
-
-    phi = 2 * np.pi * r1
-    x = np.cos(phi) * np.sqrt(r2)
-    y = np.sin(phi) * np.sqrt(r2)
-    z = np.sqrt(1 - r2)
-
-    w = normal
-    a = np.array([1, 0, 0]) if abs(w[0]) < 0.9 else np.array([0, 1, 0])
-    v = normalize(np.cross(w, a))
-    u = np.cross(v, w)
-
-    direction = x * u + y * v + z * w
-    return normalize(direction)
-
+from core.sampling import uniform_sample_hemisphere   
 
 
 def find_hit(ray):
@@ -54,7 +35,6 @@ def find_hit(ray):
     return hit_point, normal, color
 
 
-
 def path_trace(ray, depth):
     if depth == 0:
         return np.array([0.0, 0.0, 0.0])
@@ -62,24 +42,31 @@ def path_trace(ray, depth):
     hit_point, normal, color = find_hit(ray)
 
     if hit_point is None:
-        return np.array([0.0, 0.0, 0.0])
+        return np.array([0.1, 0.1, 0.15])  # background
 
-    
-    direction = sample_hemisphere(normal)
+    # ✅ USE NEW SAMPLING FUNCTION
+    direction, pdf = uniform_sample_hemisphere(normal)
 
     new_origin = hit_point + normal * 1e-4
     new_ray = Ray(new_origin, direction)
 
     indirect = path_trace(new_ray, depth - 1)
 
-    
+    # ✅ PDF + cosine correction
+    cos_theta = max(dot(normal, direction), 0)
+
+    if pdf > 0:
+        indirect = indirect * cos_theta / pdf
+    else:
+        indirect = np.array([0.0, 0.0, 0.0])
+
+    # -------- DIRECT LIGHT --------
     light_dir = normalize(light_pos - hit_point)
     distance = np.linalg.norm(light_pos - hit_point)
 
     shadow_origin = hit_point + normal * 1e-4
     shadow_ray = Ray(shadow_origin, light_dir)
 
-    # Shadow check
     in_shadow = False
 
     for obj in spheres:
@@ -99,4 +86,4 @@ def path_trace(ray, depth):
         direct = max(dot(normal, light_dir), 0) * light_intensity / (distance * distance)
 
     
-    return color * (indirect + direct)
+    return (color / np.pi) * (indirect + direct)

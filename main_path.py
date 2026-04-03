@@ -28,6 +28,7 @@ def render_row(y):
 
         pixel_color /= samples
         pixel_color = np.clip(pixel_color, 0, 1)
+        pixel_color=np.power(pixel_color,1.0/2.2)
 
         row[x] = pixel_color
 
