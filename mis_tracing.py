@@ -1,21 +1,23 @@
 """
 mis_tracing.py — Multiple Importance Sampling (MIS) path tracer.
 
-Uses one-sample MIS with the balance heuristic:
-  - Strategy 1: importance_sample_light (biased toward light)
-  - Strategy 2: uniform_sample_hemisphere (unbiased)
+Uses the multi-sample balance heuristic (Veach 1995):
+  - Strategy 1: importance_sample_light  (biased toward light source)
+  - Strategy 2: uniform_sample_hemisphere (unbiased, uniform coverage)
 
-At each hit point:
-  1. Direct illumination via explicit shadow ray (NEE)
-  2. Indirect illumination via one-sample MIS
-     → randomly pick one strategy, weight by the mixture PDF
+First bounce:   two-sample MIS — one sample from each strategy, both
+                recurse. Balance heuristic weights combine them so
+                neither strategy can hurt the other.
+Deeper bounces: single uniform sample (same as vanilla path tracing).
+
+Key optimisation: rays that start inside a sphere (contact artifacts)
+skip that sphere during intersection to prevent light tunnelling.
 """
 
 import numpy as np
 from core.ray import Ray
 from core.objects import Sphere
 from core.utils import normalize, dot
-
 from core.sampling import (
     uniform_sample_hemisphere,
     importance_sample_light,
@@ -29,9 +31,14 @@ PI = np.pi
 BG_COLOR = np.array([0.1, 0.1, 0.15])
 
 
-def intersect_scene(ray, scene):
+def intersect_scene(ray, scene, skip_inside=False):
     """
     Find the closest intersection of `ray` with any object in the scene.
+
+    If skip_inside=True, any sphere whose interior contains the ray origin
+    is excluded from intersection testing. This prevents bounce rays that
+    originate at a sphere–plane contact point from tunnelling through the
+    sphere and picking up light from the far side.
 
     Returns:
         (hit_point, normal, obj)  on hit
@@ -41,6 +48,15 @@ def intersect_scene(ray, scene):
     hit_obj = None
 
     for obj in scene["spheres"]:
+        # ── Through-ball fix ─────────────────────────────────────────
+        # If the ray starts inside this sphere, skip it entirely.
+        # This happens at sphere–ground contact points where the
+        # bounce origin (hit + normal*ε) falls just inside the sphere.
+        if skip_inside and isinstance(obj, Sphere):
+            dist_to_center = np.linalg.norm(ray.origin - obj.center)
+            if dist_to_center < obj.radius - EPSILON:
+                continue
+
         t = obj.intersect(ray)
         if t is not None and t > EPSILON and t < closest_t:
             closest_t = t
@@ -89,22 +105,38 @@ def shadow_test(hit_point, normal, light_dir, light_dist, scene):
     return 1.0
 
 
-def mis_trace(ray, scene, depth):
+def mis_trace(ray, scene, depth, first_bounce=True):
     """
-    One-sample MIS path tracer.
+    Two-sample MIS path tracer (first bounce) + path tracer (deeper bounces).
 
     At each surface hit:
-      1. Ambient term
+      1. Ambient term (small constant to prevent pure-black areas)
       2. Direct illumination via explicit shadow ray (NEE)
-      3. Indirect illumination via one-sample MIS:
-         - 50% chance: sample direction biased toward light
-         - 50% chance: sample direction uniformly over hemisphere
-         - Weight by mixture PDF (balance heuristic)
+      3. Indirect illumination:
+
+         FIRST BOUNCE — Two-sample balance heuristic:
+           Sample A: importance_sample_light direction → full recursion
+           Sample B: uniform_sample_hemisphere direction → full recursion
+
+           Each sample's contribution:
+             contrib = f(ω) / [ pdf_light(ω) + pdf_uniform(ω) ]
+
+           Key property: for uniform samples pointing AWAY from light,
+           pdf_light ≈ 0 → denominator ≈ pdf_uniform → contribution
+           matches path tracing exactly (no amplification).
+
+           The light-biased sample ADDS extra information about bright
+           directions on top. Net result: less noise.
+
+         DEEPER BOUNCES — Single uniform sample:
+           Identical to vanilla path tracing. No MIS overhead.
     """
     if depth <= 0:
         return np.zeros(3)
 
-    hit_point, normal, obj = intersect_scene(ray, scene)
+    # ── Primary ray uses normal intersection; bounce rays skip-inside ────
+    hit_point, normal, obj = intersect_scene(ray, scene,
+                                             skip_inside=(not first_bounce))
 
     if obj is None:
         return BG_COLOR.copy()
@@ -130,40 +162,77 @@ def mis_trace(ray, scene, depth):
         cos_direct = max(dot(normal, light_dir), 0.0)
         direct = brdf * light_intensity * cos_direct / (light_dist * light_dist)
 
-    # ── 3. Indirect illumination (one-sample MIS) ────────────────────────
-    #
-    # Randomly choose ONE of two strategies:
-    #   Strategy A — importance_sample_light: biased toward light direction
-    #   Strategy B — uniform_sample_hemisphere: unbiased random
-    #
-    # Mixture PDF = 0.5 × pdf_A(ω) + 0.5 × pdf_B(ω)
-    # This is the balance heuristic — provably near-optimal (Veach 1995).
-
-    if np.random.rand() < 0.5:
-        # Strategy A: light-biased sampling
-        sample_dir, pdf_sample = importance_sample_light(normal, light_dir)
-        pdf_other = 1.0 / (2.0 * PI)  # uniform hemisphere PDF
-    else:
-        # Strategy B: uniform hemisphere sampling
-        sample_dir, pdf_sample = uniform_sample_hemisphere(normal)
-        pdf_other = importance_sample_light_pdf(sample_dir, light_dir)
-
-    # Mixture PDF (balance heuristic with equal selection probabilities)
-    mixture_pdf = 0.5 * pdf_sample + 0.5 * pdf_other
-
-    # Trace the bounce ray
-    bounce_origin = hit_point + normal * EPSILON
-    bounce_ray = Ray(bounce_origin, sample_dir)
-    L_incoming = mis_trace(bounce_ray, scene, depth - 1)
-
-    cos_theta = max(dot(normal, sample_dir), 0.0)
+    # ── 3. Indirect illumination ─────────────────────────────────────────
 
     indirect = np.zeros(3)
-    if mixture_pdf > EPSILON:
-        indirect = brdf * L_incoming * cos_theta / mixture_pdf
 
-    # Clamp negative values (can arise from numerical issues)
-    indirect = np.maximum(indirect, 0.0)
+    if first_bounce:
+        # ── TWO-SAMPLE BALANCE HEURISTIC (first bounce only) ─────────────
+        #
+        # Both samples estimate the SAME integral via full recursion.
+        #
+        # Balance heuristic weight simplifies both to:
+        #   contrib(ω) = brdf × L(ω) × cos(θ) / [ pdf_light(ω) + pdf_uniform(ω) ]
+        #
+        # For uniform samples in dark directions: pdf_light ≈ 0
+        #   → denominator ≈ pdf_uniform → same as path tracing (no amplification!)
+        #
+        # For light samples in bright directions: pdf_light is large
+        #   → denominator is large → small but well-estimated contribution
+        #
+        # Net: uniform sample gives path-tracer floor, light sample adds on top.
+        # Two samples at first bounce = visible noise reduction.
+        #
+        # Cost: 2 rays here, 1 ray at deeper levels ≈ 2× total.
+
+        # Sample A: Light-biased direction
+        dir_a, pdf_a = importance_sample_light(normal, light_dir)
+        cos_a = max(dot(normal, dir_a), 0.0)
+
+        contrib_a = np.zeros(3)
+        if pdf_a > EPSILON and cos_a > 0.0:
+            bounce_ray_a = Ray(hit_point + normal * EPSILON, dir_a)
+            L_a = mis_trace(bounce_ray_a, scene, depth - 1, first_bounce=False)
+
+            # Balance heuristic denominator
+            pdf_a_uniform = 1.0 / (2.0 * PI)
+            denom_a = pdf_a + pdf_a_uniform
+
+            if denom_a > EPSILON:
+                contrib_a = brdf * L_a * cos_a / denom_a
+                contrib_a = np.maximum(contrib_a, 0.0)
+
+        # Sample B: Uniform hemisphere direction
+        dir_b, pdf_b = uniform_sample_hemisphere(normal)
+        cos_b = max(dot(normal, dir_b), 0.0)
+
+        contrib_b = np.zeros(3)
+        if pdf_b > EPSILON and cos_b > 0.0:
+            bounce_ray_b = Ray(hit_point + normal * EPSILON, dir_b)
+            L_b = mis_trace(bounce_ray_b, scene, depth - 1, first_bounce=False)
+
+            # Balance heuristic denominator
+            pdf_b_light = importance_sample_light_pdf(dir_b, light_dir)
+            denom_b = pdf_b + pdf_b_light
+
+            if denom_b > EPSILON:
+                contrib_b = brdf * L_b * cos_b / denom_b
+                contrib_b = np.maximum(contrib_b, 0.0)
+
+        # Sum of both MIS contributions
+        indirect = contrib_a + contrib_b
+
+    else:
+        # ── SINGLE UNIFORM SAMPLE (deeper bounces — plain path tracing) ──
+        dir_b, pdf_b = uniform_sample_hemisphere(normal)
+        cos_b = max(dot(normal, dir_b), 0.0)
+
+        if pdf_b > EPSILON and cos_b > 0.0:
+            bounce_ray_b = Ray(hit_point + normal * EPSILON, dir_b)
+            L_b = mis_trace(bounce_ray_b, scene, depth - 1, first_bounce=False)
+
+            contrib_b = brdf * L_b * cos_b / pdf_b
+            indirect = np.maximum(contrib_b, 0.0)
 
     # ── 4. Combine ───────────────────────────────────────────────────────
     return ambient + direct + indirect
