@@ -2,8 +2,12 @@
 __pycache__/
 *.pyc
 
-# Images (generated outputs)
+# Images (generated outputs in root)
 *.png
+
+# But allow everything in analysis/
+!analysis/
+!analysis/*
 
 # OS files (optional)
 .DS_Store
